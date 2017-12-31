@@ -1,22 +1,34 @@
 package msgime
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 )
 
+//fieldPosition describes the position of the fields in a structure
 type fieldPosition struct {
 	offset int
 	size   int
 }
 
+//uuidMimeTypeMap maps the CSID of root directory with the corresponding mimetype
 var uuidMimeTypeMap = map[string]string{
 	"00020906-0000-0000-c000-000000000046": "application/msword",
 	"00020820-0000-0000-c000-000000000046": "application/vnd.ms-excel",
 	"00020810-0000-0000-c000-000000000046": "application/vnd.ms-excel",
 }
 
+//validFileIdentifiers indicate the fileidentifiers or starting string
+//which identifies a compound file that we are targetting
+var validFileIdentifiers = [][]byte{
+	{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1},
+	//Old format of file identifier beta 2 files (late ’92)
+	{0x0e, 0x11, 0xfc, 0x0d, 0xd0, 0xcf, 0x11, 0xe0},
+}
+
+//headerMap describes the structure of header
 var headerMap = map[string]fieldPosition{
 	"FileIdentifier":                                 fieldPosition{offset: 0, size: 8},
 	"UUIDOfFile":                                     fieldPosition{offset: 8, size: 16},
@@ -37,6 +49,7 @@ var headerMap = map[string]fieldPosition{
 	"FirstPartOfMasterAllocationTable":               fieldPosition{offset: 76, size: 436},
 }
 
+//directoryMap describes the structure of directory
 var directoryMap = map[string]fieldPosition{
 	"EntryName":                   fieldPosition{offset: 0, size: 64},
 	"SizeOfEntryNameInCharacters": fieldPosition{offset: 64, size: 2},
@@ -54,11 +67,15 @@ var directoryMap = map[string]fieldPosition{
 	"Reserved":                    fieldPosition{offset: 124, size: 4},
 }
 
+//CompoundFile describes the interface with the methods that we want to expose
 type CompoundFile interface {
+	//GetMimeType returns the mimetype of the compound file
 	GetMimeType() string
+	//PrintFileInfo prints specific information of the compound file
 	PrintFileInfo()
 }
 
+//defaultCompoundFileInterface is the interface implemented by the default implmentation of CompoundFile
 type defaultCompoundFileInterface interface {
 	CompoundFile
 	//Private methods
@@ -70,6 +87,7 @@ type defaultCompoundFileInterface interface {
 	setFilename(filepath string) CompoundFile
 }
 
+//defaultCompundFile provides the default implementation of the compound file structure
 type defaultCompoundFile struct {
 	filename           string
 	header             []byte
@@ -92,6 +110,7 @@ func (cFile *defaultCompoundFile) PrintFileInfo() {
 	printValue("RevisionNumber", cFile.getValueFromHeader("RevisionNumber"))
 	printValue("VersionNumber", cFile.getValueFromHeader("VersionNumber"))
 	fmt.Printf("LittleEndian = %t", cFile.isLittleEndian())
+	fmt.Printf("Type = %v", cFile.getValueFromRootDirectory("Type"))
 }
 
 func (cFile *defaultCompoundFile) getValueFromHeader(fieldname string) []byte {
@@ -128,44 +147,75 @@ func (cFile *defaultCompoundFile) setRootDirectory(rootDirectory []byte) Compoun
 	return cFile
 }
 
+//NewCompoundFile returns the default implmentation of the compound file
 func NewCompoundFile(filepath string) (CompoundFile, error) {
 	var err error
+	var file *os.File
+	var bytesRead []byte
 	var cfile defaultCompoundFileInterface = &defaultCompoundFile{filename: filepath}
-	file, _ := os.Open(filepath)
-
+	if file, err = os.Open(filepath); err != nil {
+		return nil, err
+	}
 	defer file.Close()
 	//Header always starts at offset 0 and is of size 512
-	cfile.setHeader(read(file, 0, 512))
+	if bytesRead, err = read(file, 0, 512); err != nil {
+		return nil, err
+	}
+	cfile.setHeader(bytesRead)
+	if !validateFileIdentifier(cfile.getValueFromHeader("FileIdentifier")) {
+		err = errors.New("Invalid File Identtifier")
+		return nil, err
+	}
 	littleEndian := cfile.isLittleEndian()
 	sectorID := decodeValueAsUInt16(littleEndian, cfile.getValueFromHeader("FirstSectorID"))
 	sectorSize := decodeValueAsUInt16(littleEndian, cfile.getValueFromHeader("SizeOfSector"))
 	sectorPosition := getSectorPosition(sectorID, sectorSize)
 
 	//Sector is always of size 128
-	cfile.setRootDirectory(read(file, int64(sectorPosition), 128))
+	if bytesRead, err = read(file, int64(sectorPosition), 128); err != nil {
+		return nil, err
+	}
+	cfile.setRootDirectory(bytesRead)
+	if !validateRootDirectoryType(cfile.getValueFromRootDirectory("Type")) {
+		return nil, errors.New("Invalid type found while validating root directory. Not a compound file")
+	}
 
 	return cfile, err
 }
 
-func read(file *os.File, offset int64, size int) []byte {
-	var buffer = make([]byte, size)
-	file.Seek(offset, io.SeekStart)
-	io.ReadFull(file, buffer)
-	return buffer
+func validateFileIdentifier(fileIdentifier []byte) bool {
+	valid := false
+	for i := 0; (i < len(validFileIdentifiers)) && !valid; i++ {
+		if len(validFileIdentifiers[i]) == len(fileIdentifier) {
+			for j := 0; j < len(fileIdentifier) && !valid; j++ {
+				if fileIdentifier[j] != validFileIdentifiers[i][j] {
+					break
+				}
+				if j == (len(fileIdentifier) - 1) {
+					valid = true
+					break
+				}
+			}
+		}
+	}
+	return valid
 }
 
-func getFileSize(filepath string) (int64, error) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		panic(err)
-	}
-	fs, err := file.Stat()
-	if err != nil {
-		// Could not obtain stat, handle error
-		return -1, err
-	}
+func validateRootDirectoryType(rootDirectoryType []byte) bool {
+	return rootDirectoryType[0] == 5
+}
 
-	return fs.Size(), nil
+func read(file *os.File, offset int64, size int) ([]byte, error) {
+	var buffer = make([]byte, size)
+	file.Seek(offset, io.SeekStart)
+	bytesRead, err := io.ReadFull(file, buffer)
+	if err != nil {
+		return nil, err
+	}
+	if bytesRead != size {
+		err = fmt.Errorf("Unable to read %d bytes. File may be corrupted or not a compound file", size)
+	}
+	return buffer, err
 }
 
 func decodeValueAsUUID(littleEndian bool, value []byte) string {
